@@ -38,7 +38,7 @@ def get_alphavantage_key() -> str:
     """
     load_env()
     key = os.environ.get("ALPHAVANTAGE_API_KEY")
-    if not key:
+    if not key or key == "VOTRE_CLE_ICI":
         raise ValueError(
             "\n[ERREUR SÉCURITÉ] Clé Alpha Vantage absente ou non configurée.\n"
             "Pour protéger votre clé :\n"
