@@ -1,7 +1,7 @@
 """
 Module fonctions.py
 Contient l'ensemble des fonctions utilitaires pour :
-- Charger la configuration et sécuriser la clé d'API Alpha Vantage.
+- Demander la clé d'API Alpha Vantage à l'utilisateur (saisie masquée).
 - Récupérer et mettre en cache les données comptables SEC EDGAR (Apple CIK 0000320193).
 - Récupérer et mettre en cache les projections/consensus des analystes via Alpha Vantage.
 - Aligner temporellement les séries temporelles et calculer les métriques d'erreur de prévision.
@@ -10,6 +10,7 @@ Contient l'ensemble des fonctions utilitaires pour :
 
 import os
 import json
+import getpass
 import urllib.request
 import pandas as pd
 import numpy as np
@@ -21,31 +22,16 @@ import seaborn as sns
 # 1. GESTION SÉCURISÉE DE LA CLÉ D'API
 # ==============================================================================
 
-def load_env(env_path: str = ".env") -> None:
-    """Charge les variables d'environnement depuis le fichier .env sans dépendance externe."""
-    if os.path.exists(env_path):
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    os.environ[k.strip()] = v.strip().strip("'\"")
+_API_KEY = None
 
 def get_alphavantage_key() -> str:
-    """
-    Récupère la clé secrète Alpha Vantage depuis l'environnement ou .env.
-    Lève une exception explicite si la clé est absente pour protéger le projet.
-    """
-    load_env()
-    key = os.environ.get("ALPHAVANTAGE_API_KEY")
-    if not key or key == "VOTRE_CLE_ICI":
-        raise ValueError(
-            "\n[ERREUR SÉCURITÉ] Clé Alpha Vantage absente ou non configurée.\n"
-            "Pour protéger votre clé :\n"
-            "1. Créez un fichier '.env' à la racine du projet.\n"
-            "2. Ajoutez-y : ALPHAVANTAGE_API_KEY=votre_cle_secrete\n"
-        )
-    return key
+    """Demande la clé Alpha Vantage à l'utilisateur (une seule fois par session)."""
+    global _API_KEY
+    if not _API_KEY:
+        _API_KEY = getpass.getpass("Entrez votre clé API Alpha Vantage : ").strip()
+        if not _API_KEY:
+            raise ValueError("Aucune clé Alpha Vantage fournie.")
+    return _API_KEY
 
 
 # ==============================================================================
