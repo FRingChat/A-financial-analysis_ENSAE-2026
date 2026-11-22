@@ -1,2 +1,7 @@
+[project]
+name = "dataset-exploration-using-pandas"
+version = "0.1.0"
+description = "ENSAE S3 Pandas Project - Financial projections exploration"
+
 [tool.vercel]
-entrypoint = "app.py"
+entrypoint = "app:app"
