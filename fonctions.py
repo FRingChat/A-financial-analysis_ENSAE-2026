@@ -1,7 +1,7 @@
 """
 Module fonctions.py
 Contient l'ensemble des fonctions utilitaires pour :
-- Demander la clé d'API Alpha Vantage à l'utilisateur (saisie masquée).
+- Récupérer la clé d'API Alpha Vantage stockée de manière sécurisée sur Vercel (.env.local ou os.environ).
 - Récupérer et mettre en cache les données comptables SEC EDGAR (Apple CIK 0000320193).
 - Récupérer et mettre en cache les projections/consensus des analystes via Alpha Vantage.
 - Aligner temporellement les séries temporelles et calculer les métriques d'erreur de prévision.
@@ -10,7 +10,7 @@ Contient l'ensemble des fonctions utilitaires pour :
 
 import os
 import json
-import getpass
+import subprocess
 import urllib.request
 import pandas as pd
 import numpy as np
@@ -19,19 +19,83 @@ import seaborn as sns
 
 
 # ==============================================================================
-# 1. GESTION SÉCURISÉE DE LA CLÉ D'API
+# 1. GESTION SÉCURISÉE DE LA CLÉ D'API VIA VERCEL
 # ==============================================================================
 
-_API_KEY = None
+def load_vercel_env(env_files=(".env.local", ".env", ".env.development.local")) -> None:
+    """
+    Charge les variables d'environnement synchronisées depuis Vercel.
+    Vercel génère par défaut un fichier .env.local via la commande 'vercel env pull'.
+    """
+    for env_file in env_files:
+        if os.path.exists(env_file):
+            with open(env_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        if k not in os.environ:
+                            os.environ[k] = v
+
+def pull_vercel_env(target_file: str = ".env.local") -> bool:
+    """
+    Tente de synchroniser automatiquement les variables d'environnement depuis Vercel
+    en utilisant la commande 'npx vercel env pull'.
+    Retourne True si l'opération a réussi, False sinon.
+    """
+    try:
+        cmd = f"npx vercel env pull {target_file} --yes"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if result.returncode == 0 and os.path.exists(target_file):
+            load_vercel_env((target_file,))
+            return True
+    except Exception:
+        pass
+    return False
 
 def get_alphavantage_key() -> str:
-    """Demande la clé Alpha Vantage à l'utilisateur (une seule fois par session)."""
-    global _API_KEY
-    if not _API_KEY:
-        _API_KEY = getpass.getpass("Entrez votre clé API Alpha Vantage : ").strip()
-        if not _API_KEY:
-            raise ValueError("Aucune clé Alpha Vantage fournie.")
-    return _API_KEY
+    """
+    Récupère la clé Alpha Vantage stockée sur Vercel :
+    1. Directement depuis os.environ (environnement Vercel en production / cloud)
+    2. Depuis .env.local (fichier généré localement par 'npx vercel env pull')
+    3. Depuis .env (fichier local de secours)
+    4. Tente une synchronisation automatique si possible
+    """
+    # 1. Vérification dans l'environnement système
+    key = os.environ.get("ALPHAVANTAGE_API_KEY")
+    if key and key != "VOTRE_CLE_ICI":
+        return key
+
+    # 2. Chargement des fichiers d'environnement locaux (.env.local généré par Vercel)
+    load_vercel_env()
+    key = os.environ.get("ALPHAVANTAGE_API_KEY")
+    if key and key != "VOTRE_CLE_ICI":
+        return key
+
+    # 3. Tentative de synchronisation via Vercel CLI si le projet est lié
+    print("Tentative de synchronisation des variables d'environnement depuis Vercel...")
+    if pull_vercel_env():
+        key = os.environ.get("ALPHAVANTAGE_API_KEY")
+        if key and key != "VOTRE_CLE_ICI":
+            print("Variables d'environnement synchronisées depuis Vercel avec succès !")
+            return key
+
+    # 4. Message explicite d'aide à la synchronisation Vercel
+    raise ValueError(
+        "\n========================================================================\n"
+        "🔑 CLÉ ALPHAVANTAGE INTROUVABLE EN LOCAL\n"
+        "Votre clé est configurée dans votre projet Vercel, mais n'est pas encore\n"
+        "synchronisée sur votre machine.\n\n"
+        "Pour synchroniser votre clé depuis Vercel en 2 étapes rapides :\n"
+        "1. Dans votre terminal, liez votre dossier au projet Vercel :\n"
+        "   npx vercel link\n"
+        "2. Téléchargez votre variable d'environnement :\n"
+        "   npx vercel env pull .env.local\n\n"
+        "(Le fichier .env.local est déjà protégé dans .gitignore et ne sera jamais publié)\n"
+        "========================================================================"
+    )
 
 
 # ==============================================================================
@@ -100,31 +164,85 @@ def extract_sec_metric(facts: dict, taxonomy: str, metric_name: str, frequency: 
 # 3. EXTRACTION ET TRAITEMENT DES ESTIMATIONS ALPHA VANTAGE
 # ==============================================================================
 
-def fetch_alphavantage_earnings(symbol: str = "AAPL", cache_dir: str = "data_cache") -> pd.DataFrame:
+def fetch_alphavantage_earnings(
+    symbol: str = "AAPL",
+    cache_dir: str = "data_cache",
+    vercel_url: str = "https://dataset-exploration-using-pandas.vercel.app"
+) -> pd.DataFrame:
     """
-    Récupère l'historique des consensus de projections et résultats réels via Alpha Vantage.
-    Utilise un cache local pour respecter le quota gratuit (25 requêtes / jour).
+    Récupère l'historique des prévisions et résultats réels d'Alpha Vantage.
+    
+    Fonctionnement sans clé pour les utilisateurs externes :
+    1. Cache local : Réutilise le fichier local s'il existe (évite toute requête réseau).
+    2. Proxy Vercel public : Interroge l'API Vercel qui détient la clé secrète en toute sécurité.
+       Une limite stricte de 5 requêtes par jour par utilisateur (IP) est appliquée.
+    3. Clé locale (secours) : Si le proxy Vercel n'est pas encore déployé ou accessible,
+       utilise la clé locale (.env.local ou .env).
     """
     os.makedirs(cache_dir, exist_ok=True)
     cache_path = os.path.join(cache_dir, f"av_earnings_{symbol}.json")
 
+    # 1. Utilisation du cache local (0 requête réseau consommée lors des re-exécutions)
     if os.path.exists(cache_path):
         with open(cache_path, "r", encoding="utf-8") as f:
             raw_data = json.load(f)
     else:
-        api_key = get_alphavantage_key()
-        url = f"https://www.alphavantage.co/query?function=EARNINGS&symbol={symbol}&apikey={api_key}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as resp:
-            raw_data = json.loads(resp.read().decode('utf-8'))
+        raw_data = None
+        proxy_error = None
 
-        if "Error Message" in raw_data:
-            raise ValueError(f"Erreur Alpha Vantage : {raw_data['Error Message']}")
-        if "Information" in raw_data:
-            raise ValueError(f"Note Alpha Vantage : {raw_data['Information']}")
+        # 2. Tentative via le Proxy Vercel (sans clé pour l'utilisateur)
+        proxy_endpoint = f"{vercel_url.rstrip('/')}/api/earnings?symbol={symbol}"
+        try:
+            print(f"Tentative de récupération via le proxy Vercel ({proxy_endpoint})...")
+            req = urllib.request.Request(proxy_endpoint, headers={'User-Agent': 'ENSAE-Pandas-Client/1.0'})
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                raw_data = json.loads(resp.read().decode('utf-8'))
 
-        with open(cache_path, "w", encoding="utf-8") as f:
-            json.dump(raw_data, f, indent=2)
+            if isinstance(raw_data, dict) and "error" in raw_data and raw_data.get("error") == "Quota dépassé":
+                raise PermissionError(f"[Quota Vercel] {raw_data.get('message')}")
+
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(raw_data, f, indent=2)
+            print("Données récupérées avec succès via l'API Vercel !")
+
+        except urllib.error.HTTPError as http_err:
+            if http_err.code == 429:
+                try:
+                    err_content = json.loads(http_err.read().decode('utf-8'))
+                    msg = err_content.get("message", "Limite de 5 requêtes/jour atteinte.")
+                except Exception:
+                    msg = "Limite de 5 requêtes/jour atteinte pour votre adresse IP."
+                raise PermissionError(f"\n[QUOTA VERCEL DÉPASSÉ] {msg}\n")
+            proxy_error = f"HTTP {http_err.code}: {http_err.reason}"
+        except Exception as e:
+            proxy_error = str(e)
+
+        # 3. Secours : Clé locale si le proxy n'est pas encore déployé
+        if not raw_data or "quarterlyEarnings" not in raw_data:
+            print(f"Proxy Vercel non disponible ({proxy_error}). Tentative avec clé locale...")
+            try:
+                api_key = get_alphavantage_key()
+                url = f"https://www.alphavantage.co/query?function=EARNINGS&symbol={symbol}&apikey={api_key}"
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    raw_data = json.loads(resp.read().decode('utf-8'))
+
+                if "Error Message" in raw_data:
+                    raise ValueError(f"Erreur Alpha Vantage : {raw_data['Error Message']}")
+                if "Information" in raw_data or "Note" in raw_data:
+                    msg = raw_data.get("Information") or raw_data.get("Note")
+                    raise ValueError(f"Quota Alpha Vantage atteint : {msg}")
+
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(raw_data, f, indent=2)
+
+            except Exception as fallback_err:
+                raise RuntimeError(
+                    f"\nImpossible de récupérer les données :\n"
+                    f"- Via Proxy Vercel : {proxy_error}\n"
+                    f"- Via Clé locale : {fallback_err}\n"
+                    f"Assurez-vous d'avoir poussé votre code sur GitHub pour activer l'API Vercel."
+                )
 
     df = pd.DataFrame(raw_data.get("quarterlyEarnings", []))
     if df.empty:
