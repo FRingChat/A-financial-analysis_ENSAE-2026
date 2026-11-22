@@ -2,11 +2,7 @@
   "rewrites": [
     {
       "source": "/api/earnings",
-      "destination": "/api/index"
-    },
-    {
-      "source": "/",
-      "destination": "/api/index"
+      "destination": "/"
     }
   ]
 }
