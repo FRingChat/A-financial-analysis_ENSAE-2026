@@ -167,7 +167,7 @@ def extract_sec_metric(facts: dict, taxonomy: str, metric_name: str, frequency: 
 def fetch_alphavantage_earnings(
     symbol: str = "AAPL",
     cache_dir: str = "data_cache",
-    vercel_url: str = "https://projetprog-financeaugustinfelix-ensae-prog-27.vercel.app"
+    vercel_url: str = "https://projetprog-financeaugustinfelix.vercel.app"
 ) -> pd.DataFrame:
     """
     Récupère l'historique des prévisions et résultats réels d'Alpha Vantage.
