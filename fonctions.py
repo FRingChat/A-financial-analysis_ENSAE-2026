@@ -68,20 +68,20 @@ def get_api_key(var_name: str) -> str:
     """
     # 1. Vérification dans l'environnement système
     key = os.environ.get(var_name)
-    if key and key != "VOTRE_CLE_ICI":
+    if key and key not in ("VOTRE_CLE_ICI", "[SENSITIVE]"):
         return key
 
     # 2. Chargement des fichiers d'environnement locaux (.env.local généré par Vercel)
     load_vercel_env()
     key = os.environ.get(var_name)
-    if key and key != "VOTRE_CLE_ICI":
+    if key and key not in ("VOTRE_CLE_ICI", "[SENSITIVE]"):
         return key
 
     # 3. Tentative de synchronisation via Vercel CLI si le projet est lié
     print("Tentative de synchronisation des variables d'environnement depuis Vercel...")
     if pull_vercel_env():
         key = os.environ.get(var_name)
-        if key and key != "VOTRE_CLE_ICI":
+        if key and key not in ("VOTRE_CLE_ICI", "[SENSITIVE]"):
             print("Variables d'environnement synchronisées depuis Vercel avec succès !")
             return key
 
@@ -107,6 +107,11 @@ def get_alphavantage_key() -> str:
 
 def get_tiingo_key() -> str:
     """Récupère la clé Tiingo (variable TIINGO_API_KEY)."""
+    for var in ("TIINGO_API_KEY", "TINGO_API_KEY"):
+        try:
+            return get_api_key(var)
+        except ValueError:
+            continue
     return get_api_key("TIINGO_API_KEY")
 
 

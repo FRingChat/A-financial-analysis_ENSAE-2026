@@ -44,7 +44,7 @@ def fetch_alphavantage(symbol: str):
 
 def fetch_tiingo(symbol: str):
     """Appelle Tiingo (historique complet). Retourne (données, None) ou (None, (code, erreur))."""
-    api_key = os.environ.get('TIINGO_API_KEY')
+    api_key = os.environ.get('TIINGO_API_KEY') or os.environ.get('TINGO_API_KEY')
     if not api_key:
         return None, (500, {
             "error": "Configuration serveur manquante",
