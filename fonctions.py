@@ -12,6 +12,7 @@ Contient l'ensemble des fonctions utilitaires pour :
 
 import os
 import json
+import math
 import subprocess
 import urllib.request
 import pandas as pd
@@ -401,6 +402,73 @@ def compute_announcement_price_reaction(df_av: pd.DataFrame, df_prices: pd.DataF
     return events.reset_index(drop=True)
 
 
+def regress_price_on_surprise(
+    reaction: pd.DataFrame,
+    x_col: str = 'surprisePercentage',
+    y_col: str = 'variation_pct',
+    start_date: str = '2010-01-01'
+):
+    """
+    Régression linéaire par moindres carrés ordinaires (MCO), codée avec numpy seul :
+
+        variation_pct_t = alpha + beta * surprisePercentage_t + e_t
+
+    - Échantillon : publications à partir de start_date (les surprises des années 1996-2002
+      sont extrêmes car le BPA d'Apple était proche de 0).
+    - Écarts-types classiques ET robustes à l'hétéroscédasticité (White HC1).
+      Les tests (t, p-value, intervalle à 95 %) utilisent les écarts-types robustes.
+    - p-values approchées par la loi normale : avec ~65 observations,
+      l'écart avec la loi de Student est négligeable (seuil 5 % : 2,00 au lieu de 1,96).
+
+    Retourne (table des coefficients, dictionnaire de statistiques, échantillon utilisé).
+    """
+    sample = reaction[reaction['reportedDate'] >= start_date].dropna(subset=[x_col, y_col]).copy()
+    x = sample[x_col].to_numpy(dtype=float)
+    y = sample[y_col].to_numpy(dtype=float)
+    n, k = len(y), 2
+    if n <= k:
+        raise ValueError(f"Pas assez d'observations ({n}) pour estimer la régression.")
+
+    X = np.column_stack([np.ones(n), x])
+    XtX_inv = np.linalg.inv(X.T @ X)
+    beta = XtX_inv @ X.T @ y
+    resid = y - X @ beta
+
+    # Écarts-types classiques (homoscédasticité)
+    rss = resid @ resid
+    sigma2 = rss / (n - k)
+    se_classic = np.sqrt(np.diag(sigma2 * XtX_inv))
+
+    # Écarts-types robustes de White, correction HC1 : n / (n - k)
+    meat = X.T @ (X * (resid ** 2)[:, None])
+    cov_hc1 = XtX_inv @ meat @ XtX_inv * n / (n - k)
+    se_robust = np.sqrt(np.diag(cov_hc1))
+
+    t_stats = beta / se_robust
+    p_values = [math.erfc(abs(t) / math.sqrt(2)) for t in t_stats]
+
+    coef_table = pd.DataFrame({
+        'coefficient': beta,
+        'ecart_type_classique': se_classic,
+        'ecart_type_robuste_HC1': se_robust,
+        't_robuste': t_stats,
+        'p_value': p_values,
+        'IC95_bas': beta - 1.96 * se_robust,
+        'IC95_haut': beta + 1.96 * se_robust,
+    }, index=['constante (alpha)', f'{x_col} (beta)'])
+
+    tss = ((y - y.mean()) ** 2).sum()
+    stats = {
+        'N_Observations': n,
+        'Période': f"{sample['reportedDate'].min():%m/%Y} → {sample['reportedDate'].max():%m/%Y}",
+        'R2': round(float(1 - rss / tss), 4),
+        'R2_ajusté': round(float(1 - (rss / (n - k)) / (tss / (n - 1))), 4),
+        'Corrélation': round(float(np.corrcoef(x, y)[0, 1]), 4),
+        'Écart-type des résidus (pts de %)': round(math.sqrt(sigma2), 3),
+    }
+    return coef_table, stats, sample
+
+
 # ==============================================================================
 # 5. RAPPROCHEMENT ET ANALYSE COMPARATIVE (RÉEL VS PROJECTIONS)
 # ==============================================================================
@@ -491,6 +559,36 @@ def plot_real_vs_projected(df_comparison: pd.DataFrame, recent_only: bool = True
     plt.xlabel("Date de clôture du trimestre", fontsize=11)
     plt.ylabel("BPA Dilué (USD / action)", fontsize=11)
     plt.legend(frameon=True, loc='upper left')
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300)
+    plt.show()
+
+def plot_price_vs_surprise(sample: pd.DataFrame, coef_table: pd.DataFrame,
+                           x_col: str = 'surprisePercentage', y_col: str = 'variation_pct',
+                           save_path: str = None):
+    """Nuage de points variation du cours (J -> J+1) vs surprise de BPA, avec la droite MCO."""
+    sns.set_theme(style="whitegrid")
+    alpha, beta = coef_table['coefficient'].iloc[0], coef_table['coefficient'].iloc[1]
+    p_beta = coef_table['p_value'].iloc[1]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.axhline(0, color='#c9c8c3', linewidth=1, zorder=1)
+    ax.axvline(0, color='#c9c8c3', linewidth=1, zorder=1)
+
+    ax.scatter(sample[x_col], sample[y_col], s=55, color='#2a78d6', alpha=0.85,
+               edgecolor='white', linewidth=1.5, zorder=3, label='Publication de résultats')
+
+    x_line = np.linspace(sample[x_col].min(), sample[x_col].max(), 100)
+    ax.plot(x_line, alpha + beta * x_line, color='#52514e', linewidth=2, zorder=2,
+            label=f'Droite MCO : {alpha:.2f} + {beta:.3f} × surprise  (p = {p_beta:.3f})')
+
+    ax.set_title("Apple (AAPL) : réaction du cours à la surprise de BPA (J → J+1)",
+                 fontsize=14, fontweight='bold', pad=15)
+    ax.set_xlabel("Surprise de BPA (% du consensus)", fontsize=11)
+    ax.set_ylabel("Variation du cours J → J+1 (%)", fontsize=11)
+    ax.legend(frameon=True, loc='upper left')
     plt.tight_layout()
 
     if save_path:
