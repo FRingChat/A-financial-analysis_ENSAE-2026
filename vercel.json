@@ -3,6 +3,10 @@
     {
       "source": "/api/earnings",
       "destination": "/"
+    },
+    {
+      "source": "/api/prices",
+      "destination": "/"
     }
   ]
 }

@@ -1,9 +1,11 @@
 """
 Module fonctions.py
 Contient l'ensemble des fonctions utilitaires pour :
-- Récupérer la clé d'API Alpha Vantage stockée de manière sécurisée sur Vercel (.env.local ou os.environ).
+- Récupérer les clés d'API (Alpha Vantage, Tiingo) stockées de manière sécurisée sur Vercel (.env.local ou os.environ).
 - Récupérer et mettre en cache les données comptables SEC EDGAR (Apple CIK 0000320193).
 - Récupérer et mettre en cache les projections/consensus des analystes via Alpha Vantage.
+- Récupérer et mettre en cache les cours de bourse quotidiens via Tiingo, et mesurer la
+  réaction du cours autour de chaque publication de résultats.
 - Aligner temporellement les séries temporelles et calculer les métriques d'erreur de prévision.
 - Visualiser graphiquement les résultats réels vs prévisions.
 """
@@ -55,29 +57,29 @@ def pull_vercel_env(target_file: str = ".env.local") -> bool:
         pass
     return False
 
-def get_alphavantage_key() -> str:
+def get_api_key(var_name: str) -> str:
     """
-    Récupère la clé Alpha Vantage stockée sur Vercel :
+    Récupère une clé d'API stockée sur Vercel (ex: 'ALPHAVANTAGE_API_KEY', 'TIINGO_API_KEY') :
     1. Directement depuis os.environ (environnement Vercel en production / cloud)
     2. Depuis .env.local (fichier généré localement par 'npx vercel env pull')
     3. Depuis .env (fichier local de secours)
     4. Tente une synchronisation automatique si possible
     """
     # 1. Vérification dans l'environnement système
-    key = os.environ.get("ALPHAVANTAGE_API_KEY")
+    key = os.environ.get(var_name)
     if key and key != "VOTRE_CLE_ICI":
         return key
 
     # 2. Chargement des fichiers d'environnement locaux (.env.local généré par Vercel)
     load_vercel_env()
-    key = os.environ.get("ALPHAVANTAGE_API_KEY")
+    key = os.environ.get(var_name)
     if key and key != "VOTRE_CLE_ICI":
         return key
 
     # 3. Tentative de synchronisation via Vercel CLI si le projet est lié
     print("Tentative de synchronisation des variables d'environnement depuis Vercel...")
     if pull_vercel_env():
-        key = os.environ.get("ALPHAVANTAGE_API_KEY")
+        key = os.environ.get(var_name)
         if key and key != "VOTRE_CLE_ICI":
             print("Variables d'environnement synchronisées depuis Vercel avec succès !")
             return key
@@ -85,7 +87,7 @@ def get_alphavantage_key() -> str:
     # 4. Message explicite d'aide à la synchronisation Vercel
     raise ValueError(
         "\n========================================================================\n"
-        "🔑 CLÉ ALPHAVANTAGE INTROUVABLE EN LOCAL\n"
+        f"🔑 CLÉ {var_name} INTROUVABLE EN LOCAL\n"
         "Votre clé est configurée dans votre projet Vercel, mais n'est pas encore\n"
         "synchronisée sur votre machine.\n\n"
         "Pour synchroniser votre clé depuis Vercel en 2 étapes rapides :\n"
@@ -94,8 +96,17 @@ def get_alphavantage_key() -> str:
         "2. Téléchargez votre variable d'environnement :\n"
         "   npx vercel env pull .env.local\n\n"
         "(Le fichier .env.local est déjà protégé dans .gitignore et ne sera jamais publié)\n"
+        f"Alternative : créez vous-même un fichier .env.local contenant {var_name}=votre_cle\n"
         "========================================================================"
     )
+
+def get_alphavantage_key() -> str:
+    """Récupère la clé Alpha Vantage (variable ALPHAVANTAGE_API_KEY)."""
+    return get_api_key("ALPHAVANTAGE_API_KEY")
+
+def get_tiingo_key() -> str:
+    """Récupère la clé Tiingo (variable TIINGO_API_KEY)."""
+    return get_api_key("TIINGO_API_KEY")
 
 
 # ==============================================================================
@@ -260,7 +271,138 @@ def fetch_alphavantage_earnings(
 
 
 # ==============================================================================
-# 4. RAPPROCHEMENT ET ANALYSE COMPARATIVE (RÉEL VS PROJECTIONS)
+# 4. COURS DE BOURSE (TIINGO) ET RÉACTION AUX PUBLICATIONS DE RÉSULTATS
+# ==============================================================================
+
+def fetch_tiingo_prices(
+    symbol: str = "AAPL",
+    start_date: str = "2000-01-01",
+    cache_dir: str = "data_cache",
+    vercel_url: str = "https://projetprog-financeaugustinfelix.vercel.app",
+    force_refresh: bool = False
+) -> pd.DataFrame:
+    """
+    Récupère l'historique des cours quotidiens (clôture brute et ajustée) via Tiingo.
+
+    Même logique que fetch_alphavantage_earnings :
+    1. Cache local (data_cache/tiingo_prices_<symbol>.json), sauf si force_refresh=True
+       (utile pour inclure les séances postérieures au premier téléchargement).
+    2. Proxy Vercel public (/api/prices), qui détient la clé TIINGO_API_KEY.
+    3. Clé locale (secours) : TIINGO_API_KEY dans .env.local ou .env.
+
+    Une seule requête couvre tout l'historique depuis start_date.
+    Colonnes utiles : 'close' (prix réellement coté) et 'adjClose' (ajusté des divisions
+    d'actions et des dividendes, comparable dans le temps).
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(cache_dir, f"tiingo_prices_{symbol}.json")
+
+    raw_data = None
+    if os.path.exists(cache_path) and not force_refresh:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            raw_data = json.load(f)
+    else:
+        proxy_error = None
+
+        # 2. Tentative via le Proxy Vercel (sans clé pour l'utilisateur)
+        proxy_endpoint = f"{vercel_url.rstrip('/')}/api/prices?type=prices&symbol={symbol}"
+        try:
+            print(f"Tentative de récupération via le proxy Vercel ({proxy_endpoint})...")
+            req = urllib.request.Request(proxy_endpoint, headers={'User-Agent': 'ENSAE-Pandas-Client/1.0'})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw_data = json.loads(resp.read().decode('utf-8'))
+            if not isinstance(raw_data, list) or not raw_data:
+                proxy_error = f"Réponse inattendue du proxy : {str(raw_data)[:200]}"
+                raw_data = None
+            else:
+                print("Cours récupérés avec succès via l'API Vercel !")
+
+        except urllib.error.HTTPError as http_err:
+            if http_err.code == 429:
+                try:
+                    msg = json.loads(http_err.read().decode('utf-8')).get("message", "")
+                except Exception:
+                    msg = "Limite de 5 requêtes/jour atteinte pour votre adresse IP."
+                raise PermissionError(f"\n[QUOTA VERCEL DÉPASSÉ] {msg}\n")
+            proxy_error = f"HTTP {http_err.code}: {http_err.reason}"
+        except Exception as e:
+            proxy_error = str(e)
+
+        # 3. Secours : Clé locale
+        if raw_data is None:
+            print(f"Proxy Vercel non disponible ({proxy_error}). Tentative avec clé locale...")
+            try:
+                api_key = get_tiingo_key()
+                url = f"https://api.tiingo.com/tiingo/daily/{symbol}/prices?startDate={start_date}"
+                # La clé passe dans l'en-tête (et non dans l'URL) pour ne pas apparaître dans les logs
+                req = urllib.request.Request(url, headers={
+                    'Content-Type': 'application/json',
+                    'Authorization': f'Token {api_key}',
+                    'User-Agent': 'ENSAE-Pandas-Client/1.0'
+                })
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    raw_data = json.loads(resp.read().decode('utf-8'))
+
+                if isinstance(raw_data, dict):
+                    raise ValueError(f"Erreur Tiingo : {raw_data.get('detail', raw_data)}")
+                if not raw_data:
+                    raise ValueError(f"Aucun cours renvoyé par Tiingo pour {symbol}.")
+
+            except Exception as fallback_err:
+                raise RuntimeError(
+                    f"\nImpossible de récupérer les cours Tiingo :\n"
+                    f"- Via Proxy Vercel : {proxy_error}\n"
+                    f"- Via Clé locale : {fallback_err}\n"
+                )
+
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(raw_data, f)
+
+    df = pd.DataFrame(raw_data)
+    # Tiingo renvoie des dates du type '2024-08-01T00:00:00.000Z' : on garde la date seule
+    df["date"] = pd.to_datetime(df["date"], utc=True).dt.tz_localize(None).dt.normalize()
+    return df.sort_values("date").reset_index(drop=True)
+
+
+def compute_announcement_price_reaction(df_av: pd.DataFrame, df_prices: pd.DataFrame) -> pd.DataFrame:
+    """
+    Mesure la réaction du cours à chaque publication de résultats (fenêtre J -> J+1).
+
+    Apple publie ses résultats APRÈS la clôture de la bourse le jour J (reportedDate) :
+    - clôture de J   = dernier prix AVANT l'information
+    - clôture de J+1 = premier prix APRÈS l'information (prochaine séance de bourse)
+
+    La variation est calculée sur les prix ajustés (adjClose), seuls comparables si une
+    division d'actions ou un détachement de dividende tombe dans la fenêtre.
+    """
+    events = df_av[['fiscalDateEnding', 'reportedDate', 'reportedEPS', 'estimatedEPS',
+                    'surprise', 'surprisePercentage']].dropna(subset=['reportedDate'])
+    events = events.sort_values('reportedDate')
+
+    prices = df_prices[['date', 'close', 'adjClose']].sort_values('date')
+    before = prices.rename(columns={'date': 'date_J', 'close': 'close_J', 'adjClose': 'adjClose_J'})
+    after = prices.rename(columns={'date': 'date_J1', 'close': 'close_J1', 'adjClose': 'adjClose_J1'})
+
+    # Clôture de J : dernière séance <= J (= J lui-même si J est un jour de bourse)
+    events = pd.merge_asof(events, before, left_on='reportedDate', right_on='date_J',
+                           direction='backward', tolerance=pd.Timedelta('5 days'))
+    # Clôture de J+1 : première séance strictement postérieure à J
+    events = pd.merge_asof(events, after, left_on='reportedDate', right_on='date_J1',
+                           direction='forward', allow_exact_matches=False,
+                           tolerance=pd.Timedelta('5 days'))
+
+    # Publications trop récentes (J+1 pas encore coté) ou hors de l'historique de prix
+    events = events.dropna(subset=['close_J', 'close_J1']).copy()
+
+    # Contrôle qualité : J devrait toujours être un jour de bourse
+    events['J_jour_de_bourse'] = events['date_J'] == events['reportedDate']
+
+    events['variation_pct'] = (events['adjClose_J1'] / events['adjClose_J'] - 1) * 100
+    return events.reset_index(drop=True)
+
+
+# ==============================================================================
+# 5. RAPPROCHEMENT ET ANALYSE COMPARATIVE (RÉEL VS PROJECTIONS)
 # ==============================================================================
 
 def compare_real_vs_projections(df_sec_eps: pd.DataFrame, df_av: pd.DataFrame) -> pd.DataFrame:
@@ -313,7 +455,7 @@ def compute_forecast_metrics(df_comparison: pd.DataFrame) -> dict:
 
 
 # ==============================================================================
-# 5. VISUALISATION GRAPHIQUE
+# 6. VISUALISATION GRAPHIQUE
 # ==============================================================================
 
 def plot_real_vs_projected(df_comparison: pd.DataFrame, recent_only: bool = True, save_path: str = None):
