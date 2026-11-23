@@ -642,6 +642,7 @@ def plot_real_vs_projected(df_comparison: pd.DataFrame, recent_only: bool = True
         df['sec_real_eps'],
         df['estimatedEPS'],
         where=(df['sec_real_eps'] >= df['estimatedEPS']),
+        interpolate=True,
         color='green', alpha=0.2, label='Surprise Positive (Réel > Projection)'
     )
     plt.fill_between(
@@ -649,6 +650,7 @@ def plot_real_vs_projected(df_comparison: pd.DataFrame, recent_only: bool = True
         df['sec_real_eps'],
         df['estimatedEPS'],
         where=(df['sec_real_eps'] < df['estimatedEPS']),
+        interpolate=True,
         color='red', alpha=0.2, label='Surprise Négative (Réel < Projection)'
     )
 
