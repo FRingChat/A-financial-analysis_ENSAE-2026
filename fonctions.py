@@ -177,6 +177,97 @@ def extract_sec_metric(facts: dict, taxonomy: str, metric_name: str, frequency: 
     return df
 
 
+def get_split_events(symbol: str = "AAPL") -> pd.Series:
+    """
+    Renvoie les divisions d'actions (date -> ratio, ex. 4.0 pour un 4:1) à partir
+    de la colonne 'splitFactor' des cours Tiingo (cache local data_cache/).
+    """
+    prices = fetch_tiingo_prices(symbol=symbol)
+    splits = prices.loc[prices['splitFactor'] != 1, ['date', 'splitFactor']]
+    # Tiingo renvoie parfois 7.000007 au lieu de 7 : on arrondit au ratio entier
+    return pd.Series(splits['splitFactor'].round(0).values, index=splits['date'].values)
+
+
+def split_adjust_per_share(df: pd.DataFrame, splits: pd.Series) -> pd.DataFrame:
+    """
+    Ramène une métrique par action SEC (ex. BPA) à la base de titres actuelle.
+
+    Une valeur SEC est exprimée dans la base de titres en vigueur à sa date de dépôt
+    ('filed') : elle doit donc être divisée par toutes les divisions postérieures à ce dépôt.
+    (Une même période peut avoir été retraitée dans un dépôt ultérieur : c'est la date
+    du dépôt retenu qui compte, pas la fin de période.)
+    Ajoute les colonnes 'val_brut' (valeur publiée) et 'facteur_split'.
+    """
+    df = df.copy()
+    df['val_brut'] = df['val']
+    df['facteur_split'] = [
+        float(np.prod(splits[splits.index > filed].values)) if len(splits) else 1.0
+        for filed in df['filed']
+    ]
+    df['val'] = df['val_brut'] / df['facteur_split']
+    return df
+
+
+def build_quarterly_eps(
+    facts: dict,
+    symbol: str = "AAPL",
+    metric_name: str = 'EarningsPerShareDiluted',
+    taxonomy: str = 'us-gaap'
+) -> pd.DataFrame:
+    """
+    BPA trimestriel complet et comparable dans le temps :
+    1. Trimestres publiés (10-Q / 10-K de ~3 mois) via extract_sec_metric.
+    2. Ajustement des divisions d'actions (base de titres actuelle, comme Alpha Vantage).
+    3. Reconstitution des T4 manquants : le 10-K ne publie souvent que le BPA annuel,
+       d'où T4 = BPA annuel - (T1 + T2 + T3). Approximation : le BPA n'est pas
+       parfaitement additif (le nombre moyen d'actions varie au cours de l'exercice).
+       Ces lignes sont marquées 'q4_derive' = True.
+    """
+    splits = get_split_events(symbol)
+    quarterly = split_adjust_per_share(
+        extract_sec_metric(facts, taxonomy, metric_name, frequency='quarterly'), splits)
+    quarterly['q4_derive'] = False
+
+    # Exercices complets (~1 an), dédupliqués par fin de période comme les trimestres
+    units = facts[taxonomy][metric_name]['units']
+    annual = pd.DataFrame(units[list(units.keys())[0]])
+    annual = annual[annual['form'] == '10-K'].copy()
+    for col in ['start', 'end', 'filed']:
+        annual[col] = pd.to_datetime(annual[col])
+    annual['duration_days'] = (annual['end'] - annual['start']).dt.days
+    annual = annual[annual['duration_days'].between(350, 380)]
+    annual = annual.sort_values('filed').groupby('end').last().reset_index()
+    annual = split_adjust_per_share(annual, splits)
+
+    derived_rows = []
+    for _, year in annual.iterrows():
+        in_year = quarterly[(quarterly['start'] >= year['start']) & (quarterly['end'] <= year['end'])]
+        q4_present = (in_year['end'] - year['end']).abs().min() <= pd.Timedelta('7 days') if len(in_year) else False
+        if len(in_year) != 3 or q4_present:
+            continue  # T4 déjà publié, ou trimestres T1-T3 incomplets : rien à reconstituer
+        q3_end = in_year['end'].max()
+        derived_rows.append({
+            'end': year['end'],
+            'start': q3_end + pd.Timedelta('1 day'),
+            'val': year['val'] - in_year['val'].sum(),
+            'val_brut': np.nan,
+            'facteur_split': year['facteur_split'],
+            'accn': year['accn'],
+            'fy': year['end'].year,
+            'fp': 'Q4',
+            'form': '10-K (T4 dérivé)',
+            'filed': year['filed'],
+            'frame': np.nan,
+            'duration_days': (year['end'] - q3_end).days,
+            'metric_name': metric_name,
+            'q4_derive': True,
+        })
+
+    if derived_rows:
+        quarterly = pd.concat([quarterly, pd.DataFrame(derived_rows)], ignore_index=True)
+    return quarterly.sort_values('end').reset_index(drop=True)
+
+
 # ==============================================================================
 # 3. EXTRACTION ET TRAITEMENT DES ESTIMATIONS ALPHA VANTAGE
 # ==============================================================================
@@ -483,7 +574,8 @@ def compare_real_vs_projections(df_sec_eps: pd.DataFrame, df_av: pd.DataFrame) -
     Rapproche les données réelles déclarées à la SEC avec les prévisions moyennes d'analystes.
     Utilise merge_asof pour aligner les fins de trimestres fiscales (tolérance 7 jours).
     """
-    sec_clean = df_sec_eps[['end', 'val', 'fy', 'fp', 'form']].sort_values('end')
+    sec_cols = ['end', 'val', 'fy', 'fp', 'form'] + (['q4_derive'] if 'q4_derive' in df_sec_eps.columns else [])
+    sec_clean = df_sec_eps[sec_cols].sort_values('end')
     sec_clean = sec_clean.rename(columns={'val': 'sec_real_eps', 'end': 'sec_date'})
 
     av_clean = df_av.sort_values('fiscalDateEnding').rename(columns={'fiscalDateEnding': 'av_date'})
