@@ -509,11 +509,11 @@ def regress_price_on_surprise(
 
         variation_pct_t = alpha + beta * surprisePercentage_t + e_t
 
-    - Échantillon : publications à partir de start_date (les surprises des années 1996-2002
+    - Échantillon : publications à partir de start_date (les surprises des années 1996-2009
       sont extrêmes car le BPA d'Apple était proche de 0).
     - Écarts-types classiques ET robustes à l'hétéroscédasticité (White HC1).
       Les tests (t, p-value, intervalle à 95 %) utilisent les écarts-types robustes.
-    - p-values approchées par la loi normale : avec ~65 observations,
+    - p-values approchées par la loi normale : avec ~70 observations,
       l'écart avec la loi de Student est négligeable (seuil 5 % : 2,00 au lieu de 1,96).
 
     Retourne (table des coefficients, dictionnaire de statistiques, échantillon utilisé).
@@ -623,15 +623,26 @@ def compute_forecast_metrics(df_comparison: pd.DataFrame) -> dict:
 # 6. VISUALISATION GRAPHIQUE
 # ==============================================================================
 
-def plot_real_vs_projected(df_comparison: pd.DataFrame, recent_only: bool = True, save_path: str = None):
-    """Génère un graphique comparatif Réel vs Consensus d'analystes."""
+def filter_from_report_date(df_comparison: pd.DataFrame, start_date: str = None) -> pd.DataFrame:
+    """
+    Garde les trimestres publiés à partir de start_date (colonne 'reportedDate' d'Alpha Vantage),
+    soit le même critère que regress_price_on_surprise : les graphiques couvrent ainsi
+    exactement les publications de l'échantillon de régression.
+    """
+    df = df_comparison.sort_values('sec_date').copy()
+    if start_date is not None:
+        df = df[df['reportedDate'] >= start_date]
+    return df
+
+
+def plot_real_vs_projected(df_comparison: pd.DataFrame, start_date: str = None, save_path: str = None):
+    """
+    Graphique Réel vs Consensus d'analystes, un point par trimestre.
+    df_comparison doit venir de compare_real_vs_projections appliqué à build_quarterly_eps
+    (BPA ajusté des divisions d'actions, T4 reconstitués) : tous les points sont trimestriels.
+    """
     sns.set_theme(style="whitegrid")
-    df = df_comparison.copy()
-    
-    # Apple a effectué un split d'actions 4:1 en août 2020. Filtrer sur les années récentes (post-2020)
-    # permet d'avoir des ordres de grandeur parfaitement comparables pour la visualisation
-    if recent_only:
-        df = df[df['sec_date'] >= '2020-10-01']
+    df = filter_from_report_date(df_comparison, start_date)
 
     plt.figure(figsize=(12, 6))
     plt.plot(df['sec_date'], df['sec_real_eps'], marker='o', color='#1f77b4', linewidth=2, label='BPA Réel (SEC EDGAR)')
@@ -654,7 +665,9 @@ def plot_real_vs_projected(df_comparison: pd.DataFrame, recent_only: bool = True
         color='red', alpha=0.2, label='Surprise Négative (Réel < Projection)'
     )
 
-    plt.title("Apple Inc. (AAPL) : Bénéfice par Action Réel vs Consensus Prévisionnel", fontsize=14, fontweight='bold', pad=15)
+    plt.title(f"Apple Inc. (AAPL) : BPA trimestriel Réel vs Consensus Prévisionnel "
+              f"(publications {df['reportedDate'].min():%Y}-{df['reportedDate'].max():%Y}, {len(df)} trimestres)",
+              fontsize=14, fontweight='bold', pad=15)
     plt.xlabel("Date de clôture du trimestre", fontsize=11)
     plt.ylabel("BPA Dilué (USD / action)", fontsize=11)
     plt.legend(frameon=True, loc='upper left')
@@ -694,20 +707,19 @@ def plot_price_vs_surprise(sample: pd.DataFrame, coef_table: pd.DataFrame,
         plt.savefig(save_path, dpi=300)
     plt.show()
 
-def plot_error_distribution(df_comparison: pd.DataFrame, recent_only: bool = True, save_path: str = None):
-    """Génère la distribution des erreurs de prévision (Surprises)."""
+def plot_error_distribution(df_comparison: pd.DataFrame, start_date: str = None, save_path: str = None):
+    """Distribution des erreurs de prévision trimestrielles (Réel - Projection)."""
     sns.set_theme(style="whitegrid")
-    df = df_comparison.copy()
-    if recent_only:
-        df = df[df['sec_date'] >= '2020-10-01']
+    df = filter_from_report_date(df_comparison, start_date)
 
     plt.figure(figsize=(9, 5))
-    sns.histplot(df['forecast_error'], kde=True, color='#2ca02c', bins=12)
+    sns.histplot(df['forecast_error'], kde=True, color='#2ca02c', bins=20)
     plt.axvline(0, color='red', linestyle='--', linewidth=1.5, label='Erreur nulle (Projection exacte)')
-    plt.axvline(df['forecast_error'].mean(), color='blue', linestyle=':', linewidth=2, 
-                label=f'Biais moyen = +{df["forecast_error"].mean():.2f} $')
+    plt.axvline(df['forecast_error'].mean(), color='blue', linestyle=':', linewidth=2,
+                label=f'Biais moyen = {df["forecast_error"].mean():+.2f} $')
 
-    plt.title("Distribution des erreurs de prévision (Réel - Projection)", fontsize=13, fontweight='bold')
+    plt.title(f"Distribution des erreurs de prévision trimestrielles (Réel - Projection), "
+              f"publications {df['reportedDate'].min():%Y}-{df['reportedDate'].max():%Y}", fontsize=13, fontweight='bold')
     plt.xlabel("Écart de BPA (USD / action)", fontsize=11)
     plt.ylabel("Fréquence (Trimestres)", fontsize=11)
     plt.legend()
