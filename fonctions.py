@@ -14,6 +14,7 @@ import os
 import json
 import math
 import subprocess
+import urllib.error
 import urllib.request
 import pandas as pd
 import numpy as np
@@ -49,8 +50,9 @@ def pull_vercel_env(target_file: str = ".env.local") -> bool:
     Retourne True si l'opération a réussi, False sinon.
     """
     try:
-        cmd = f"npx vercel env pull {target_file} --yes"
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        # 'npx --yes' évite que npx attende une confirmation d'installation (blocage sans terminal)
+        cmd = f"npx --yes vercel env pull {target_file} --yes"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
         if result.returncode == 0 and os.path.exists(target_file):
             load_vercel_env((target_file,))
             return True
@@ -58,30 +60,43 @@ def pull_vercel_env(target_file: str = ".env.local") -> bool:
         pass
     return False
 
-def get_api_key(var_name: str) -> str:
+PLACEHOLDER_KEYS = ("VOTRE_CLE_ICI", "[SENSITIVE]")
+
+def _read_key(var_names) -> str:
+    """Première variable d'environnement renseignée parmi var_names (None sinon)."""
+    for name in var_names:
+        key = os.environ.get(name)
+        if key and key not in PLACEHOLDER_KEYS:
+            return key
+    return None
+
+def get_api_key(var_name: str, aliases: tuple = ()) -> str:
     """
     Récupère une clé d'API stockée sur Vercel (ex: 'ALPHAVANTAGE_API_KEY', 'TIINGO_API_KEY') :
     1. Directement depuis os.environ (environnement Vercel en production / cloud)
     2. Depuis .env.local (fichier généré localement par 'npx vercel env pull')
     3. Depuis .env (fichier local de secours)
-    4. Tente une synchronisation automatique si possible
+    4. Tente une synchronisation automatique si possible (une seule fois)
+    aliases : autres noms acceptés pour la même clé (ex. orthographe alternative).
     """
+    names = (var_name,) + tuple(aliases)
+
     # 1. Vérification dans l'environnement système
-    key = os.environ.get(var_name)
-    if key and key not in ("VOTRE_CLE_ICI", "[SENSITIVE]"):
+    key = _read_key(names)
+    if key:
         return key
 
     # 2. Chargement des fichiers d'environnement locaux (.env.local généré par Vercel)
     load_vercel_env()
-    key = os.environ.get(var_name)
-    if key and key not in ("VOTRE_CLE_ICI", "[SENSITIVE]"):
+    key = _read_key(names)
+    if key:
         return key
 
     # 3. Tentative de synchronisation via Vercel CLI si le projet est lié
     print("Tentative de synchronisation des variables d'environnement depuis Vercel...")
     if pull_vercel_env():
-        key = os.environ.get(var_name)
-        if key and key not in ("VOTRE_CLE_ICI", "[SENSITIVE]"):
+        key = _read_key(names)
+        if key:
             print("Variables d'environnement synchronisées depuis Vercel avec succès !")
             return key
 
@@ -106,13 +121,8 @@ def get_alphavantage_key() -> str:
     return get_api_key("ALPHAVANTAGE_API_KEY")
 
 def get_tiingo_key() -> str:
-    """Récupère la clé Tiingo (variable TIINGO_API_KEY)."""
-    for var in ("TIINGO_API_KEY", "TINGO_API_KEY"):
-        try:
-            return get_api_key(var)
-        except ValueError:
-            continue
-    return get_api_key("TIINGO_API_KEY")
+    """Récupère la clé Tiingo (variable TIINGO_API_KEY, ou TINGO_API_KEY par tolérance)."""
+    return get_api_key("TIINGO_API_KEY", aliases=("TINGO_API_KEY",))
 
 
 # ==============================================================================
@@ -148,9 +158,16 @@ def extract_sec_metric(facts: dict, taxonomy: str, metric_name: str, frequency: 
         taxonomy : 'us-gaap' ou 'dei'
         metric_name : Nom XBRL de la métrique (ex: 'EarningsPerShareDiluted', 'NetIncomeLoss')
         frequency : 'quarterly' pour les trimestres (~3 mois) ou 'annual' pour les exercices complets (10-K)
+
+    Une même période apparaît dans plusieurs dépôts (dépôt d'origine, puis colonnes de
+    comparaison des rapports suivants) : on garde la ligne du dépôt le plus récent.
+    Attention : les colonnes 'fy', 'fp', 'form' et 'filed' décrivent alors CE dépôt
+    (ex. un 10-K d'un exercice ultérieur), et non la période elle-même.
     """
     if metric_name not in facts.get(taxonomy, {}):
         raise KeyError(f"Métrique '{metric_name}' non trouvée dans la taxonomie {taxonomy}")
+    if frequency not in ('quarterly', 'annual'):
+        raise ValueError("frequency doit valoir 'quarterly' ou 'annual'")
 
     units_dict = facts[taxonomy][metric_name]['units']
     unit_key = list(units_dict.keys())[0]
@@ -159,22 +176,38 @@ def extract_sec_metric(facts: dict, taxonomy: str, metric_name: str, frequency: 
     df['end'] = pd.to_datetime(df['end'])
     df['filed'] = pd.to_datetime(df['filed'])
 
+    # Trimestres : ~3 mois (75 à 105 jours), ce qui élimine les cumuls semestriels ou annuels.
+    # Exercices : ~1 an (350 à 380 jours), publiés dans les 10-K.
     if frequency == 'quarterly':
-        df = df[df['form'].isin(['10-Q', '10-K'])].copy()
-        if 'start' in df.columns:
-            df['start'] = pd.to_datetime(df['start'])
-            # Périodes d'environ 3 mois (75 à 105 jours) pour éliminer les cumuls semestriels ou annuels
-            df['duration_days'] = (df['end'] - df['start']).dt.days
-            df = df[(df['duration_days'] >= 75) & (df['duration_days'] <= 105)].copy()
-        # Déduplication en cas de dépôt modificatif (garde le dépôt le plus récent)
-        df = df.sort_values('filed').groupby('end').last().reset_index()
+        forms, (min_days, max_days) = ['10-Q', '10-K'], (75, 105)
+    else:
+        forms, (min_days, max_days) = ['10-K'], (350, 380)
 
-    elif frequency == 'annual':
-        df = df[(df['form'] == '10-K') & (df['fp'] == 'FY')].copy()
-        df = df.sort_values('filed').groupby('fy').last().reset_index()
+    df = df[df['form'].isin(forms)].copy()
+    if 'start' in df.columns:
+        df['start'] = pd.to_datetime(df['start'])
+        df['duration_days'] = (df['end'] - df['start']).dt.days
+        df = df[df['duration_days'].between(min_days, max_days)].copy()
+
+    # Déduplication par période (garde la ligne entière du dépôt le plus récent)
+    df = df.sort_values('filed').drop_duplicates('end', keep='last').reset_index(drop=True)
 
     df['metric_name'] = metric_name
     return df
+
+
+def label_fiscal_quarters(ends: pd.Series, fiscal_year_end: pd.Timestamp) -> pd.DataFrame:
+    """
+    Exercice ('fy') et trimestre fiscal ('fp' = Q1..Q4) de chaque fin de trimestre, déduits
+    du calendrier à partir d'une fin d'exercice de référence (ex. 27/09/2025 pour Apple).
+    L'exercice porte le nom de l'année civile où il se termine (convention d'Apple).
+    """
+    # Nombre de trimestres (~91,3 jours) séparant chaque fin de trimestre de la référence
+    n = ((ends - fiscal_year_end).dt.days / 91.31).round().astype(int)
+    return pd.DataFrame({
+        'fy': fiscal_year_end.year + (n + 3) // 4,
+        'fp': 'Q' + ((n - 1) % 4 + 1).astype(str),
+    }, index=ends.index)
 
 
 def get_split_events(symbol: str = "AAPL") -> pd.Series:
@@ -222,6 +255,9 @@ def build_quarterly_eps(
        d'où T4 = BPA annuel - (T1 + T2 + T3). Approximation : le BPA n'est pas
        parfaitement additif (le nombre moyen d'actions varie au cours de l'exercice).
        Ces lignes sont marquées 'q4_derive' = True.
+    4. Colonnes 'fy' / 'fp' recalculées à partir des dates (exercice et trimestre fiscal
+       de la période), car celles de la SEC décrivent le dépôt retenu (voir extract_sec_metric).
+       'form' et 'filed' restent ceux du dépôt retenu.
     """
     splits = get_split_events(symbol)
     quarterly = split_adjust_per_share(
@@ -229,15 +265,8 @@ def build_quarterly_eps(
     quarterly['q4_derive'] = False
 
     # Exercices complets (~1 an), dédupliqués par fin de période comme les trimestres
-    units = facts[taxonomy][metric_name]['units']
-    annual = pd.DataFrame(units[list(units.keys())[0]])
-    annual = annual[annual['form'] == '10-K'].copy()
-    for col in ['start', 'end', 'filed']:
-        annual[col] = pd.to_datetime(annual[col])
-    annual['duration_days'] = (annual['end'] - annual['start']).dt.days
-    annual = annual[annual['duration_days'].between(350, 380)]
-    annual = annual.sort_values('filed').groupby('end').last().reset_index()
-    annual = split_adjust_per_share(annual, splits)
+    annual = split_adjust_per_share(
+        extract_sec_metric(facts, taxonomy, metric_name, frequency='annual'), splits)
 
     derived_rows = []
     for _, year in annual.iterrows():
@@ -265,7 +294,11 @@ def build_quarterly_eps(
 
     if derived_rows:
         quarterly = pd.concat([quarterly, pd.DataFrame(derived_rows)], ignore_index=True)
-    return quarterly.sort_values('end').reset_index(drop=True)
+    quarterly = quarterly.sort_values('end').reset_index(drop=True)
+
+    # Exercice / trimestre fiscal de chaque période, calés sur la dernière fin d'exercice connue
+    quarterly[['fy', 'fp']] = label_fiscal_quarters(quarterly['end'], annual['end'].max())
+    return quarterly
 
 
 # ==============================================================================
@@ -291,11 +324,15 @@ def fetch_alphavantage_earnings(
     cache_path = os.path.join(cache_dir, f"av_earnings_{symbol}.json")
 
     # 1. Utilisation du cache local (0 requête réseau consommée lors des re-exécutions)
+    raw_data = None
     if os.path.exists(cache_path):
         with open(cache_path, "r", encoding="utf-8") as f:
             raw_data = json.load(f)
-    else:
-        raw_data = None
+        if not (isinstance(raw_data, dict) and "quarterlyEarnings" in raw_data):
+            print(f"Cache {cache_path} invalide (pas de 'quarterlyEarnings') : nouvelle récupération.")
+            raw_data = None
+
+    if raw_data is None:
         proxy_error = None
 
         # 2. Tentative via le Proxy Vercel (sans clé pour l'utilisateur)
@@ -306,12 +343,16 @@ def fetch_alphavantage_earnings(
             with urllib.request.urlopen(req, timeout=12) as resp:
                 raw_data = json.loads(resp.read().decode('utf-8'))
 
-            if isinstance(raw_data, dict) and "error" in raw_data and raw_data.get("error") == "Quota dépassé":
-                raise PermissionError(f"[Quota Vercel] {raw_data.get('message')}")
-
-            with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump(raw_data, f, indent=2)
-            print("Données récupérées avec succès via l'API Vercel !")
+            # Seule une réponse contenant les résultats trimestriels est mise en cache : un message
+            # d'erreur (ex. quota Alpha Vantage renvoyé avec un statut 200) bloquerait sinon
+            # toutes les exécutions suivantes.
+            if isinstance(raw_data, dict) and "quarterlyEarnings" in raw_data:
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(raw_data, f, indent=2)
+                print("Données récupérées avec succès via l'API Vercel !")
+            else:
+                proxy_error = f"Réponse inattendue du proxy : {str(raw_data)[:200]}"
+                raw_data = None
 
         except urllib.error.HTTPError as http_err:
             if http_err.code == 429:
@@ -326,7 +367,7 @@ def fetch_alphavantage_earnings(
             proxy_error = str(e)
 
         # 3. Secours : Clé locale si le proxy n'est pas encore déployé
-        if not raw_data or "quarterlyEarnings" not in raw_data:
+        if raw_data is None:
             print(f"Proxy Vercel non disponible ({proxy_error}). Tentative avec clé locale...")
             try:
                 api_key = get_alphavantage_key()
@@ -340,6 +381,8 @@ def fetch_alphavantage_earnings(
                 if "Information" in raw_data or "Note" in raw_data:
                     msg = raw_data.get("Information") or raw_data.get("Note")
                     raise ValueError(f"Quota Alpha Vantage atteint : {msg}")
+                if "quarterlyEarnings" not in raw_data:
+                    raise ValueError(f"Réponse inattendue d'Alpha Vantage : {str(raw_data)[:200]}")
 
                 with open(cache_path, "w", encoding="utf-8") as f:
                     json.dump(raw_data, f, indent=2)
@@ -611,11 +654,11 @@ def compute_forecast_metrics(df_comparison: pd.DataFrame) -> dict:
     
     return {
         'N_Observations': len(df_comparison),
-        'MAE (USD/action)': round(mae, 4),
-        'RMSE (USD/action)': round(rmse, 4),
-        'Biais Moyen (USD/action)': round(bias, 4),
-        'MAPE (%)': round(mape, 2),
-        'Taux Surprise Positive (%)': round(beat_rate, 2)
+        'MAE (USD/action)': round(float(mae), 4),
+        'RMSE (USD/action)': round(float(rmse), 4),
+        'Biais Moyen (USD/action)': round(float(bias), 4),
+        'MAPE (%)': round(float(mape), 2),
+        'Taux Surprise Positive (%)': round(float(beat_rate), 2)
     }
 
 

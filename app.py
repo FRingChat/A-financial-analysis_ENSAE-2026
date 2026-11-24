@@ -111,8 +111,12 @@ def process_request(route: str, symbol: str, client_ip: str):
         response_data, error = ROUTES[route]["fetch"](symbol)
         if error:
             return error[0], error[1], {}
-        if ROUTES[route]["is_valid"](response_data):
-            DATA_CACHE[cache_key] = {"data": response_data, "timestamp": now}
+        if not ROUTES[route]["is_valid"](response_data):
+            # Ex. message de quota Alpha Vantage renvoyé avec un statut 200 : on le signale comme
+            # une erreur (non mise en cache, non décomptée du quota) plutôt que de le transmettre
+            return 502, {"error": "Réponse inattendue de la source de données",
+                         "details": str(response_data)[:300]}, {}
+        DATA_CACHE[cache_key] = {"data": response_data, "timestamp": now}
 
     valid_timestamps.append(now)
     IP_REQUESTS[rate_key] = valid_timestamps
