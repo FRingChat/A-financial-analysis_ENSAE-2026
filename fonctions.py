@@ -743,7 +743,7 @@ def plot_price_vs_surprise(sample: pd.DataFrame, coef_table: pd.DataFrame,
                  fontsize=14, fontweight='bold', pad=15)
     ax.set_xlabel("Surprise de BPA (% du consensus)", fontsize=11)
     ax.set_ylabel("Variation du cours J → J+1 (%)", fontsize=11)
-    ax.legend(frameon=True, loc='upper left')
+    ax.legend(frameon=True, loc='lower right')
     plt.tight_layout()
 
     if save_path:
